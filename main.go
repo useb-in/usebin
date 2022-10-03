@@ -19,6 +19,7 @@ func main() {
 	flag.StringVar(&argv.nntpPass, "nntp-pass", "", "NNTP provider password")
 	flag.IntVar(&argv.nntpConcurrency, "nntp-concurrency", 50, "maximum concurrent NNTP connections")
 	flag.StringVar(&argv.defaultNewsgroup, "default-newsgroup", "alt.binaries.misc", "Default Usenet Newsgroup to get or post articles")
+	flag.Uint64Var(&argv.articleSizeLimit, "article-size-limit", 1024*1024*4, "Maximum article length to read")
 
 	flag.Parse()
 
