@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"crypto/tls"
 	"embed"
 	"errors"
@@ -16,25 +15,23 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"github.com/silenceper/pool"
 	"gopkg.in/nntp.v0"
 	"gopkg.in/pwgen.v0"
 )
 
 type server struct {
-	host              string
-	port              string
-	nntpServer        string
-	nntpUser          string
-	nntpPass          string
-	nntpConcurrency   int
-	tlsServerCertFile string
-	tlsServerKeyFile  string
-	pool              pool.Pool
-	defaultNewsgroup  string
-	articleSizeLimit  uint64
-	bufPool           sync.Pool
+	Host             string
+	Port             uint16
+	NNTPServers      []NNTPServer
+	IdleConnExpiry   int64
+	DefaultNewsgroup string
+	ArticleSizeLimit uint64
+	CertFile         string
+	KeyFile          string
+	pool             *Pool
+	bufPool          sync.Pool
 }
 
 //go:embed static
@@ -83,13 +80,10 @@ func (s *server) handleMessageGET(w http.ResponseWriter, r *http.Request, messag
 		return
 	}
 
-	if v, err = s.pool.Get(); err != nil {
-		log.Printf("[ERROR] %s %s pool error: %s", r.Method, messageID, err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	} else {
-		conn = v.(*nntp.Conn)
-	}
+	v = s.bufPool.Get()
+	defer s.bufPool.Put(v)
+	buf = v.([]byte)
+
 	defer func() {
 		if err == nil && conn != nil {
 			s.pool.Put(conn)
@@ -97,16 +91,27 @@ func (s *server) handleMessageGET(w http.ResponseWriter, r *http.Request, messag
 			s.pool.Close(conn)
 		}
 	}()
-	if article, err = conn.CmdArticle(nntp.ArticleMessageID(messageID)); err != nil {
-		log.Printf("[ERROR] %s %s NNTP error: %s", r.Method, messageID, err.Error())
-		w.WriteHeader(http.StatusNotFound)
-		return
+
+	for found, retries := false, 0; !found; retries++ {
+		if conn, err = s.pool.Get(false, messageID, retries); errors.Is(err, ErrNoMoreServers) {
+			log.Printf("[ERROR] %s %s not found", r.Method, messageID)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		} else if err != nil {
+			log.Printf("[ERROR] %s %s pool error: %s", r.Method, messageID, err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if article, err = conn.CmdArticle(nntp.ArticleMessageID(messageID)); errors.Is(err, nntp.ResponseCodeNoSuchArticleId) {
+			s.pool.Put(conn)
+		} else if err != nil {
+			log.Printf("[ERROR] %s %s NNTP error: %s", r.Method, messageID, err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		found = true
 	}
 
-	v = s.bufPool.Get()
-	defer s.bufPool.Put(v)
-
-	buf = v.([]byte)
 	if n, err = io.ReadFull(article.Body, buf); err == io.ErrUnexpectedEOF {
 		err = nil
 	} else if err != nil {
@@ -184,6 +189,10 @@ func (s *server) handleMessageGET(w http.ResponseWriter, r *http.Request, messag
 	}
 
 	for key, values := range article.Header {
+		switch strings.ToLower(key) {
+		case "organization", "x-complaints-to":
+			continue
+		}
 		for _, value := range values {
 			w.Header().Add("X-Usenet-"+key, value)
 		}
@@ -212,12 +221,10 @@ func (s *server) handleMessagePOST(w http.ResponseWriter, r *http.Request, messa
 		conn *nntp.Conn
 		ngID string
 	)
-	if v, err := s.pool.Get(); err != nil {
+	if conn, err = s.pool.Get(true, messageID, 0); err != nil {
 		log.Printf("[ERROR] POST %s pool error: %s", messageID, err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
 		return
-	} else {
-		conn = v.(*nntp.Conn)
 	}
 	defer func() {
 		if err == nil && conn != nil {
@@ -253,7 +260,7 @@ func (s *server) handleMessagePOST(w http.ResponseWriter, r *http.Request, messa
 		if query.Get("g") != "" {
 			header.Set("Newsgroups", query.Get("g"))
 		} else {
-			header.Set("Newsgroups", s.defaultNewsgroup)
+			header.Set("Newsgroups", s.DefaultNewsgroup)
 		}
 	}
 	if header.Get("Subject") == "" {
@@ -286,46 +293,31 @@ func (s *server) handleMessagePOST(w http.ResponseWriter, r *http.Request, messa
 }
 
 func (s *server) Serve() (err error) {
-	if s.nntpServer == "" {
-		err = fmt.Errorf("--nntp-server is required")
+	if len(s.NNTPServers) == 0 {
+		err = fmt.Errorf("no NNTP server definitions")
 		return
+	}
+	if s.Host == "" {
+		s.Host = "0.0.0.0"
+	}
+	if s.Port == 0 {
+		s.Port = 80
+	}
+	if s.IdleConnExpiry == 0 {
+		s.IdleConnExpiry = 60
+	}
+	if s.DefaultNewsgroup == "" {
+		s.DefaultNewsgroup = "alt.binaries.misc"
+	}
+	if s.ArticleSizeLimit == 0 {
+		s.ArticleSizeLimit = 4 * 1024 * 1024 // 4MB
 	}
 
 	s.bufPool = sync.Pool{New: func() any {
-		return make([]byte, s.articleSizeLimit)
+		return make([]byte, s.ArticleSizeLimit)
 	}}
 
-	s.pool, err = pool.NewChannelPool(&pool.Config{
-		InitialCap: 1,
-		MaxCap:     s.nntpConcurrency,
-		MaxIdle:    s.nntpConcurrency,
-		Factory: func() (v interface{}, err error) {
-			var d nntp.Dialer
-			conn, err := d.Dial(context.Background(), "tcp", s.nntpServer)
-			if err != nil {
-				return
-			}
-			if s.nntpUser != "" {
-				if err = conn.CmdAuthinfo(s.nntpUser, s.nntpPass); err != nil {
-					conn.Close()
-					return
-				}
-			}
-			v = conn
-			return
-		},
-		Close: func(v interface{}) (err error) {
-			conn, ok := v.(*nntp.Conn)
-			if !ok {
-				err = fmt.Errorf("invalid conn type")
-				return
-			}
-			return conn.Close()
-		},
-	})
-	if err != nil {
-		return
-	}
+	s.pool = NewPool(s.NNTPServers, time.Second*time.Duration(s.IdleConnExpiry))
 
 	subFS, err := fs.Sub(staticFS, "static")
 	if err != nil {
@@ -348,13 +340,13 @@ func (s *server) Serve() (err error) {
 	})
 
 	httpServer := &http.Server{
-		Addr:    s.host + ":" + s.port,
+		Addr:    fmt.Sprintf("%s:%d", s.Host, s.Port),
 		Handler: handler,
 	}
 
-	if s.tlsServerCertFile != "" && s.tlsServerKeyFile != "" {
+	if s.CertFile != "" && s.KeyFile != "" {
 		var serverCert tls.Certificate
-		if serverCert, err = tls.LoadX509KeyPair(s.tlsServerCertFile, s.tlsServerKeyFile); err != nil {
+		if serverCert, err = tls.LoadX509KeyPair(s.CertFile, s.KeyFile); err != nil {
 			return
 		}
 		httpServer.TLSConfig = &tls.Config{
@@ -367,89 +359,5 @@ func (s *server) Serve() (err error) {
 		log.Printf("Listening at http://%s\n", httpServer.Addr)
 		err = httpServer.ListenAndServe()
 	}
-	return
-}
-
-type hookedResponseWriter struct {
-	http.ResponseWriter
-	got404 bool
-}
-
-func (hrw *hookedResponseWriter) WriteHeader(status int) {
-	if status == http.StatusNotFound {
-		// Don't actually write the 404 header, just set a flag.
-		hrw.got404 = true
-	} else {
-		hrw.ResponseWriter.WriteHeader(status)
-	}
-}
-
-func (hrw *hookedResponseWriter) Write(p []byte) (int, error) {
-	if hrw.got404 {
-		// No-op, but pretend that we wrote len(p) bytes to the writer.
-		return len(p), nil
-	}
-
-	return hrw.ResponseWriter.Write(p)
-}
-
-func intercept404(handler, on404 http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hookedWriter := &hookedResponseWriter{ResponseWriter: w}
-		handler.ServeHTTP(hookedWriter, r)
-		if hookedWriter.got404 {
-			on404.ServeHTTP(w, r)
-		}
-	})
-}
-
-func serveFileContents(file string, files http.FileSystem) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Restrict only to instances where the browser is looking for an HTML file
-		if !strings.Contains(r.Header.Get("Accept"), "text/html") {
-			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprint(w, "404 not found")
-			return
-		}
-
-		// Open the file and return its contents using http.ServeContent
-		index, err := files.Open(file)
-		if err != nil {
-			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprintf(w, "%s not found", file)
-			return
-		}
-
-		fi, err := index.Stat()
-		if err != nil {
-			w.WriteHeader(http.StatusNotFound)
-			fmt.Fprintf(w, "%s not found", file)
-			return
-		}
-
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		http.ServeContent(w, r, fi.Name(), fi.ModTime(), index)
-	}
-}
-
-// countingWriter counts how many bytes have been written to it.
-type countingWriter int64
-
-func (w *countingWriter) Write(p []byte) (n int, err error) {
-	*w += countingWriter(len(p))
-	return len(p), nil
-}
-
-// rangesMIMESize returns the number of bytes it takes to encode the
-// provided ranges as a multipart response.
-func rangesMIMESize(ranges []httpRange, contentType string, contentSize int64) (encSize int64) {
-	var w countingWriter
-	mw := multipart.NewWriter(&w)
-	for _, ra := range ranges {
-		mw.CreatePart(ra.mimeHeader(contentType, contentSize))
-		encSize += ra.length
-	}
-	mw.Close()
-	encSize += int64(w)
 	return
 }
