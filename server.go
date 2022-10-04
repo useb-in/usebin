@@ -60,6 +60,7 @@ func (s *server) handleMessage(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleMessageGET(w http.ResponseWriter, r *http.Request, messageID nntp.MessageID) {
 	var (
 		err         error
+		nntpErr     *nntp.Error
 		conn        *nntp.Conn
 		article     *nntp.Article
 		v           any
@@ -72,6 +73,8 @@ func (s *server) handleMessageGET(w http.ResponseWriter, r *http.Request, messag
 		rangeReq    string
 		done        bool
 		code        int
+		found       bool
+		retries     int
 	)
 
 	ctype := "text/plain; charset=utf-8"
@@ -85,31 +88,40 @@ func (s *server) handleMessageGET(w http.ResponseWriter, r *http.Request, messag
 	buf = v.([]byte)
 
 	defer func() {
-		if err == nil && conn != nil {
-			s.pool.Put(conn)
-		} else {
-			s.pool.Close(conn)
+		if conn != nil {
+			if err == nil || errors.As(err, &nntpErr) {
+				// NNTP error, connection still intact, don't throw away the conn
+				s.pool.Put(conn)
+			} else {
+				s.pool.Close(conn)
+			}
 		}
 	}()
 
-	for found, retries := false, 0; !found; retries++ {
+	for found, retries = false, 0; !found; retries++ {
 		if conn, err = s.pool.Get(false, messageID, retries); errors.Is(err, ErrNoMoreServers) {
-			log.Printf("[ERROR] %s %s not found", r.Method, messageID)
-			w.WriteHeader(http.StatusNotFound)
-			return
+			break
 		} else if err != nil {
 			log.Printf("[ERROR] %s %s pool error: %s", r.Method, messageID, err.Error())
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		if article, err = conn.CmdArticle(nntp.ArticleMessageID(messageID)); errors.Is(err, nntp.ResponseCodeNoSuchArticleId) {
-			s.pool.Put(conn)
-		} else if err != nil {
-			log.Printf("[ERROR] %s %s NNTP error: %s", r.Method, messageID, err.Error())
+		if article, err = conn.CmdArticle(nntp.ArticleMessageID(messageID)); err != nil {
+			if errors.As(err, &nntpErr) {
+				s.pool.Put(conn)
+				continue
+			}
+			log.Printf("[ERROR] %s %s connection error: %s", r.Method, messageID, err.Error())
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		found = true
+	}
+
+	if !found {
+		log.Printf("[ERROR] %s %s not found", r.Method, messageID)
+		w.WriteHeader(http.StatusNotFound)
+		return
 	}
 
 	if n, err = io.ReadFull(article.Body, buf); err == io.ErrUnexpectedEOF {
@@ -218,12 +230,13 @@ func (s *server) handleMessageGET(w http.ResponseWriter, r *http.Request, messag
 
 func (s *server) handleMessagePOST(w http.ResponseWriter, r *http.Request, messageID nntp.MessageID) {
 	var (
-		err  error
-		conn *nntp.Conn
-		ngID string
-		v    any
-		size int
-		buf  []byte
+		err     error
+		nntpErr *nntp.Error
+		conn    *nntp.Conn
+		ngID    string
+		v       any
+		size    int
+		buf     []byte
 	)
 
 	v = s.bufPool.Get()
@@ -248,18 +261,6 @@ func (s *server) handleMessagePOST(w http.ResponseWriter, r *http.Request, messa
 		return
 	}
 
-	if conn, err = s.pool.Get(true, messageID, 0); err != nil {
-		log.Printf("[ERROR] POST %s pool error: %s", messageID, err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	defer func() {
-		if err == nil && conn != nil {
-			s.pool.Put(conn)
-		} else {
-			s.pool.Close(conn)
-		}
-	}()
 	query := r.URL.Query()
 	header := make(textproto.MIMEHeader)
 	for key, values := range r.Header {
@@ -310,11 +311,39 @@ func (s *server) handleMessagePOST(w http.ResponseWriter, r *http.Request, messa
 		Header:    header,
 		Body:      bytes.NewReader(buf[:size]),
 	}
-	if err = conn.CmdPost(article); err != nil {
-		log.Printf("[ERROR] POST %s NNTP error: %s", messageID, err.Error())
-		w.WriteHeader(http.StatusConflict)
+
+	defer func() {
+		if conn != nil {
+			if err == nil || errors.As(err, &nntpErr) {
+				// NNTP error, connection still intact, don't throw away the conn
+				s.pool.Put(conn)
+			} else {
+				s.pool.Close(conn)
+			}
+		}
+	}()
+
+	if conn, err = s.pool.Get(false, messageID, 0); err != nil {
+		if errors.Is(err, ErrNoMoreServers) {
+			log.Printf("[ERROR] %s %s no posting servers?", r.Method, messageID)
+			return
+		} else {
+			log.Printf("[ERROR] %s %s pool error: %s", r.Method, messageID, err.Error())
+		}
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	nntpErr = nil
+	if err = conn.CmdPost(article); err != nil {
+		if errors.Is(err, nntp.ResponseCodePostingFailure) {
+			w.WriteHeader(http.StatusConflict)
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		log.Printf("[ERROR] %s %s error: %s", r.Method, messageID, err.Error())
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
 	log.Printf("[INFO] POST %s", messageID)
 }

@@ -72,7 +72,8 @@ func (p *Pool) Get(posting bool, messageID nntp.MessageID, retry int) (conn *nnt
 	// pseudo-randomly convert the message ID into a server index so we choose a server uniformly
 	// this also makes sure such selection is persistent for subsequent call for the same message ID
 	sum := sha256.Sum256([]byte(messageID))
-	src := rand.NewSource(int64(binary.LittleEndian.Uint64(sum[:8])))
+	seed := binary.LittleEndian.Uint64(sum[:8])
+	src := rand.NewSource(int64(seed))
 	r := rand.New(src).Intn(len(p.servers))
 	// however if the caller desires a different server, possibly due to content availability issues,
 	// iterate through the server list to find another one.
@@ -84,7 +85,7 @@ func (p *Pool) Get(posting bool, messageID nntp.MessageID, retry int) (conn *nnt
 		if server.Posting || !posting {
 			tries++
 			if tries > retry {
-				p.getChan <- &poolGet{i, ret}
+				p.getChan <- &poolGet{n, ret}
 				result := <-ret
 				conn, err = result.conn, result.err
 				return
