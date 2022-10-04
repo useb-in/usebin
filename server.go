@@ -116,6 +116,7 @@ func (s *server) handleMessageGET(w http.ResponseWriter, r *http.Request, messag
 		err = nil
 	} else if err != nil {
 		log.Printf("[ERROR] %s %s read error: %s", r.Method, messageID, err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	if _, err = article.Body.Read(nil); !errors.Is(err, io.EOF) {
@@ -220,7 +221,33 @@ func (s *server) handleMessagePOST(w http.ResponseWriter, r *http.Request, messa
 		err  error
 		conn *nntp.Conn
 		ngID string
+		v    any
+		size int
+		buf  []byte
 	)
+
+	v = s.bufPool.Get()
+	defer s.bufPool.Put(v)
+	buf = v.([]byte)
+
+	if size, err = io.ReadFull(r.Body, buf); err == io.ErrUnexpectedEOF {
+		err = nil
+	} else if err != nil {
+		log.Printf("[ERROR] %s %s read error: %s", r.Method, messageID, err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if _, err = r.Body.Read(nil); !errors.Is(err, io.EOF) {
+		log.Printf("[ERROR] %s %s size exceeds limit", r.Method, messageID)
+		w.WriteHeader(http.StatusInsufficientStorage)
+		return
+	}
+	if size == 0 {
+		log.Printf("[ERROR] %s %s empty file", r.Method, messageID)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	if conn, err = s.pool.Get(true, messageID, 0); err != nil {
 		log.Printf("[ERROR] POST %s pool error: %s", messageID, err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
@@ -281,7 +308,7 @@ func (s *server) handleMessagePOST(w http.ResponseWriter, r *http.Request, messa
 	article := &nntp.Article{
 		MessageID: messageID,
 		Header:    header,
-		Body:      r.Body,
+		Body:      bytes.NewReader(buf[:size]),
 	}
 	if err = conn.CmdPost(article); err != nil {
 		log.Printf("[ERROR] POST %s NNTP error: %s", messageID, err.Error())
