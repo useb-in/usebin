@@ -11,7 +11,6 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
-	"net/textproto"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +18,7 @@ import (
 
 	"gopkg.in/nntp.v0"
 	"gopkg.in/pwgen.v0"
+	"gopkg.in/textproto.v0"
 )
 
 type server struct {
@@ -37,7 +37,15 @@ type server struct {
 //go:embed static
 var staticFS embed.FS
 
-func (s *server) handleMessage(w http.ResponseWriter, r *http.Request) {
+func (s *server) handleDotDecodedMessage(w http.ResponseWriter, r *http.Request) {
+	s.handleMessage(w, r, false)
+}
+
+func (s *server) handleDotEncodedMessage(w http.ResponseWriter, r *http.Request) {
+	s.handleMessage(w, r, true)
+}
+
+func (s *server) handleMessage(w http.ResponseWriter, r *http.Request, dotEncoded bool) {
 	name := r.URL.Path[3:]
 	// https://developers.cloudflare.com/cache/about/default-cache-behavior/#default-cached-file-extensions
 	if !strings.HasSuffix(name, ".csv") && !strings.HasSuffix(name, ".nfo") {
@@ -49,12 +57,94 @@ func (s *server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	if r.Method == http.MethodGet && dotEncoded {
+		s.handleDotEncodedMessageGET(w, r, messageID)
+		return
+	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
 		s.handleMessageGET(w, r, messageID)
 	case http.MethodPost:
-		s.handleMessagePOST(w, r, messageID)
+		s.handleMessagePOST(w, r, messageID, dotEncoded)
 	}
+}
+
+func (s *server) handleDotEncodedMessageGET(w http.ResponseWriter, r *http.Request, messageID nntp.MessageID) {
+	var (
+		err     error
+		nntpErr *nntp.Error
+		conn    *nntp.Conn
+		article *nntp.Article
+		done    bool
+		found   bool
+		retries int
+	)
+
+	ctype := "text/plain; charset=utf-8"
+
+	if done, _ = checkPreconditions(w, r); done {
+		return
+	}
+
+	defer func() {
+		if conn != nil {
+			if err == nil || errors.As(err, &nntpErr) {
+				// NNTP error, connection still intact, don't throw away the conn
+				s.pool.Put(conn)
+			} else {
+				s.pool.Close(conn)
+			}
+		}
+	}()
+
+	for found, retries = false, 0; !found; retries++ {
+		if conn, err = s.pool.Get(false, messageID, retries); errors.Is(err, ErrNoMoreServers) {
+			break
+		} else if err != nil {
+			log.Printf("[ERROR] %s (RAW) %s pool error: %s", r.Method, messageID, err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if article, err = conn.CmdArticle(nntp.ArticleMessageID(messageID), nntp.WithDotEncodedBody()); err != nil {
+			if errors.As(err, &nntpErr) {
+				s.pool.Put(conn)
+				continue
+			}
+			log.Printf("[ERROR] %s (RAW) %s connection error: %s", r.Method, messageID, err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		found = true
+	}
+
+	if !found {
+		log.Printf("[ERROR] %s (RAW) %s not found", r.Method, messageID)
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	for key, values := range article.Header {
+		switch strings.ToLower(key) {
+		case "organization", "x-complaints-to":
+			continue
+		}
+		for _, value := range values {
+			w.Header().Add("X-Usenet-"+key, value)
+		}
+	}
+	w.Header().Set("Content-Type", ctype)
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("ETag", "\""+string(messageID.Short())+"\"")
+
+	w.WriteHeader(http.StatusOK)
+
+	if _, err = io.Copy(w, io.LimitReader(article.Body, int64(s.ArticleSizeLimit))); err != nil {
+		log.Printf("[ERROR] %s (RAW) %s write error: %s", r.Method, messageID, err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[INFO] %s (RAW) %s", r.Method, messageID)
 }
 
 func (s *server) handleMessageGET(w http.ResponseWriter, r *http.Request, messageID nntp.MessageID) {
@@ -228,38 +318,13 @@ func (s *server) handleMessageGET(w http.ResponseWriter, r *http.Request, messag
 	log.Printf("[INFO] %s %s", r.Method, messageID)
 }
 
-func (s *server) handleMessagePOST(w http.ResponseWriter, r *http.Request, messageID nntp.MessageID) {
+func (s *server) handleMessagePOST(w http.ResponseWriter, r *http.Request, messageID nntp.MessageID, dotEncoded bool) {
 	var (
 		err     error
 		nntpErr *nntp.Error
 		conn    *nntp.Conn
 		ngID    string
-		v       any
-		size    int
-		buf     []byte
 	)
-
-	v = s.bufPool.Get()
-	defer s.bufPool.Put(v)
-	buf = v.([]byte)
-
-	if size, err = io.ReadFull(r.Body, buf); err == io.ErrUnexpectedEOF {
-		err = nil
-	} else if err != nil {
-		log.Printf("[ERROR] %s %s read error: %s", r.Method, messageID, err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	if _, err = r.Body.Read(nil); !errors.Is(err, io.EOF) {
-		log.Printf("[ERROR] %s %s size exceeds limit", r.Method, messageID)
-		w.WriteHeader(http.StatusInsufficientStorage)
-		return
-	}
-	if size == 0 {
-		log.Printf("[ERROR] %s %s empty file", r.Method, messageID)
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
 
 	query := r.URL.Query()
 	header := make(textproto.MIMEHeader)
@@ -303,13 +368,10 @@ func (s *server) handleMessagePOST(w http.ResponseWriter, r *http.Request, messa
 			header.Set("Subject", shortID)
 		}
 	}
-	if r.Header.Get("Content-Length") != "" {
-		header.Set("Content-Length", r.Header.Get("Content-Length"))
-	}
 	article := &nntp.Article{
 		MessageID: messageID,
 		Header:    header,
-		Body:      bytes.NewReader(buf[:size]),
+		Body:      io.LimitReader(r.Body, int64(s.ArticleSizeLimit)),
 	}
 
 	defer func() {
@@ -323,7 +385,7 @@ func (s *server) handleMessagePOST(w http.ResponseWriter, r *http.Request, messa
 		}
 	}()
 
-	if conn, err = s.pool.Get(false, messageID, 0); err != nil {
+	if conn, err = s.pool.Get(true, messageID, 0); err != nil {
 		if errors.Is(err, ErrNoMoreServers) {
 			log.Printf("[ERROR] %s %s no posting servers?", r.Method, messageID)
 			return
@@ -333,8 +395,14 @@ func (s *server) handleMessagePOST(w http.ResponseWriter, r *http.Request, messa
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	nntpErr = nil
-	if err = conn.CmdPost(article); err != nil {
+
+	if dotEncoded {
+		err = conn.CmdPost(article, nntp.WithDotEncodedBody())
+	} else {
+		err = conn.CmdPost(article)
+	}
+
+	if err != nil {
 		if errors.Is(err, nntp.ResponseCodePostingFailure) {
 			w.WriteHeader(http.StatusConflict)
 		} else {
@@ -384,7 +452,8 @@ func (s *server) Serve() (err error) {
 	serveIndex := serveFileContents("index.html", httpFS)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/m/", s.handleMessage)
+	mux.HandleFunc("/m/", s.handleDotDecodedMessage)
+	mux.HandleFunc("/d/", s.handleDotEncodedMessage)
 	mux.Handle("/", intercept404(fileServer, serveIndex))
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
