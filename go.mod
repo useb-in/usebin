@@ -12,6 +12,7 @@ require (
 require (
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/robertkrimen/otto v0.0.0-20211024170158-b87d35c0b86f // indirect
+	github.com/stretchr/testify v1.8.0 // indirect
 	golang.org/x/net v0.0.0-20221004154528-8021a29435af // indirect
 	gopkg.in/option.v0 v0.0.0-20220910000000-360f43518c40 // indirect
 	gopkg.in/rx.v0 v0.0.0-20220421053708-ed88ff42144d // indirect

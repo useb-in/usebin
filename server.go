@@ -37,36 +37,67 @@ type server struct {
 //go:embed static
 var staticFS embed.FS
 
-func (s *server) handleDotDecodedMessage(w http.ResponseWriter, r *http.Request) {
-	s.handleMessage(w, r, false)
-}
+type Entity int
 
-func (s *server) handleDotEncodedMessage(w http.ResponseWriter, r *http.Request) {
-	s.handleMessage(w, r, true)
-}
+const (
+	Static Entity = iota
+	FullArticle
+	ArticleHead
+)
 
-func (s *server) handleMessage(w http.ResponseWriter, r *http.Request, dotEncoded bool) {
-	name := r.URL.Path[3:]
-	// https://developers.cloudflare.com/cache/about/default-cache-behavior/#default-cached-file-extensions
-	if !strings.HasSuffix(name, ".csv") && !strings.HasSuffix(name, ".nfo") {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	messageID := nntp.MessageID(name[:len(name)-4])
-	if messageID.Validate() != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	if r.Method == http.MethodGet && dotEncoded {
-		s.handleDotEncodedMessageGET(w, r, messageID)
-		return
-	}
-	switch r.Method {
-	case http.MethodGet, http.MethodHead:
-		s.handleMessageGET(w, r, messageID)
-	case http.MethodPost:
-		s.handleMessagePOST(w, r, messageID, dotEncoded)
-	}
+func (s *server) handleMessage(staticHandler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var (
+			entity     Entity
+			dotEncoded bool
+			messageID  nntp.MessageID
+		)
+
+		// https://developers.cloudflare.com/cache/about/default-cache-behavior/#default-cached-file-extensions
+		if name := r.URL.Path[3:]; !strings.HasSuffix(name, ".csv") && !strings.HasSuffix(name, ".nfo") {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		} else if messageID = nntp.MessageID(name[:len(name)-4]); messageID.Validate() != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		switch r.URL.Path[:3] {
+		case "/m/":
+			entity = FullArticle
+			dotEncoded = false
+		case "/d/":
+			entity = FullArticle
+			dotEncoded = true
+		case "/h/":
+			entity = ArticleHead
+		default:
+			entity = Static
+		}
+
+		// general headers
+		w.Header().Set("Cache-Control", "public, max-age=2592000")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
+		switch entity {
+		case FullArticle:
+			if r.Method == http.MethodGet && dotEncoded {
+				s.handleDotEncodedMessageGET(w, r, messageID)
+				return
+			}
+			switch r.Method {
+			case http.MethodGet, http.MethodHead:
+				s.handleMessageGET(w, r, messageID)
+			case http.MethodPost:
+				s.handleMessagePOST(w, r, messageID, dotEncoded)
+			}
+		case ArticleHead:
+			s.handleMessageHead(w, r, messageID)
+		default:
+			staticHandler.ServeHTTP(w, r)
+		}
+	})
 }
 
 func (s *server) handleDotEncodedMessageGET(w http.ResponseWriter, r *http.Request, messageID nntp.MessageID) {
@@ -416,6 +447,78 @@ func (s *server) handleMessagePOST(w http.ResponseWriter, r *http.Request, messa
 	log.Printf("[INFO] POST %s", messageID)
 }
 
+func (s *server) handleMessageHead(w http.ResponseWriter, r *http.Request, messageID nntp.MessageID) {
+	var (
+		err     error
+		nntpErr *nntp.Error
+		conn    *nntp.Conn
+		article *nntp.Article
+		done    bool
+		found   bool
+		retries int
+	)
+
+	ctype := "text/plain; charset=utf-8"
+
+	if done, _ = checkPreconditions(w, r); done {
+		return
+	}
+
+	defer func() {
+		if conn != nil {
+			if err == nil || errors.As(err, &nntpErr) {
+				// NNTP error, connection still intact, don't throw away the conn
+				s.pool.Put(conn)
+			} else {
+				s.pool.Close(conn)
+			}
+		}
+	}()
+
+	for found, retries = false, 0; !found; retries++ {
+		if conn, err = s.pool.Get(false, messageID, retries); errors.Is(err, ErrNoMoreServers) {
+			break
+		} else if err != nil {
+			log.Printf("[ERROR] %s %s pool error: %s", r.Method, messageID, err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if article, err = conn.CmdHead(nntp.ArticleMessageID(messageID)); err != nil {
+			if errors.As(err, &nntpErr) {
+				s.pool.Put(conn)
+				continue
+			}
+			log.Printf("[ERROR] %s %s connection error: %s", r.Method, messageID, err.Error())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		found = true
+	}
+
+	if !found {
+		log.Printf("[ERROR] %s %s not found", r.Method, messageID)
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	for key, values := range article.Header {
+		switch strings.ToLower(key) {
+		case "organization", "x-complaints-to":
+			continue
+		}
+		for _, value := range values {
+			w.Header().Add("X-Usenet-"+key, value)
+		}
+	}
+	w.Header().Set("Content-Type", ctype)
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("ETag", "\""+string(messageID.Short())+"\"")
+
+	w.WriteHeader(http.StatusOK)
+
+	log.Printf("[INFO] HEAD %s", messageID)
+}
+
 func (s *server) Serve() (err error) {
 	if len(s.NNTPServers) == 0 {
 		err = fmt.Errorf("no NNTP server definitions")
@@ -450,23 +553,12 @@ func (s *server) Serve() (err error) {
 	httpFS := http.FS(subFS)
 	fileServer := http.FileServer(httpFS)
 	serveIndex := serveFileContents("index.html", httpFS)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/m/", s.handleDotDecodedMessage)
-	mux.HandleFunc("/d/", s.handleDotEncodedMessage)
-	mux.Handle("/", intercept404(fileServer, serveIndex))
-
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// general headers
-		w.Header().Set("Cache-Control", "public, max-age=2592000")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		mux.ServeHTTP(w, r)
-	})
+	staticHandler := intercept404(fileServer, serveIndex)
+	mainHandler := s.handleMessage(staticHandler)
 
 	httpServer := &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", s.Host, s.Port),
-		Handler: handler,
+		Handler: mainHandler,
 	}
 
 	if s.CertFile != "" && s.KeyFile != "" {
