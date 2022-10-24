@@ -35,6 +35,13 @@ func main() {
 		log.Fatal("cannot parse config file", err)
 	}
 
+	if server.CertFile != "" {
+		server.CertFile = filepath.Join(confPath, server.CertFile)
+	}
+	if server.KeyFile != "" {
+		server.KeyFile = filepath.Join(confPath, server.KeyFile)
+	}
+
 	flag.Parse()
 	if *cpuprofile != "" {
 		f, err := os.Create(*cpuprofile)

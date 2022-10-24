@@ -479,7 +479,7 @@ func (s *server) handleMessageHead(w http.ResponseWriter, r *http.Request, messa
 		if conn, err = s.pool.Get(false, messageID, retries); errors.Is(err, ErrNoMoreServers) {
 			break
 		} else if err != nil {
-			log.Printf("[ERROR] %s %s pool error: %s", r.Method, messageID, err.Error())
+			log.Printf("[ERROR] %s %s HEAD pool error: %s", r.Method, messageID, err.Error())
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -488,7 +488,7 @@ func (s *server) handleMessageHead(w http.ResponseWriter, r *http.Request, messa
 				s.pool.Put(conn)
 				continue
 			}
-			log.Printf("[ERROR] %s %s connection error: %s", r.Method, messageID, err.Error())
+			log.Printf("[ERROR] %s %s HEAD connection error: %s", r.Method, messageID, err.Error())
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -496,7 +496,7 @@ func (s *server) handleMessageHead(w http.ResponseWriter, r *http.Request, messa
 	}
 
 	if !found {
-		log.Printf("[ERROR] %s %s not found", r.Method, messageID)
+		log.Printf("[ERROR] %s %s HEAD not found", r.Method, messageID)
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -516,7 +516,7 @@ func (s *server) handleMessageHead(w http.ResponseWriter, r *http.Request, messa
 
 	w.WriteHeader(http.StatusOK)
 
-	log.Printf("[INFO] HEAD %s", messageID)
+	log.Printf("[INFO] %s %s HEAD", r.Method, messageID)
 }
 
 func (s *server) Serve() (err error) {
